@@ -23,7 +23,6 @@
  * who were very cooperative and answered my questions.
  */
 
-#include <linux/init.h>
 #include <linux/signal.h>
 #include <linux/slab.h>
 #include <linux/module.h>
@@ -33,6 +32,7 @@
 #include <linux/can.h>
 #include <linux/can/dev.h>
 #include <linux/can/error.h>
+#include <linux/can/led.h>
 
 /* driver constants */
 #define MAX_RX_URBS			20
@@ -201,8 +201,7 @@ static int usb_8dev_wait_cmd_msg(struct usb_8dev_priv *priv, u8 *msg, int size,
 			    msg, size, actual_length, USB_8DEV_CMD_TIMEOUT);
 }
 
-/*
- * Send command to device and receive result.
+/* Send command to device and receive result.
  * Command was successful when opt1 = 0.
  */
 static int usb_8dev_send_cmd(struct usb_8dev_priv *priv,
@@ -319,8 +318,7 @@ static int usb_8dev_cmd_version(struct usb_8dev_priv *priv, u32 *res)
 	return err;
 }
 
-/*
- * Set network device mode
+/* Set network device mode
  *
  * Maybe we should leave this function empty, because the device
  * set mode variable with open command.
@@ -352,8 +350,7 @@ static void usb_8dev_rx_err_msg(struct usb_8dev_priv *priv,
 	struct sk_buff *skb;
 	struct net_device_stats *stats = &priv->netdev->stats;
 
-	/*
-	 * Error message:
+	/* Error message:
 	 * byte 0: Status
 	 * byte 1: bit   7: Receive Passive
 	 * byte 1: bit 0-6: Receive Error Counter
@@ -380,6 +377,7 @@ static void usb_8dev_rx_err_msg(struct usb_8dev_priv *priv,
 	case USB_8DEV_STATUSMSG_BUSOFF:
 		priv->can.state = CAN_STATE_BUS_OFF;
 		cf->can_id |= CAN_ERR_BUSOFF;
+		priv->can.can_stats.bus_off++;
 		can_bus_off(priv->netdev);
 		break;
 	case USB_8DEV_STATUSMSG_OVERRUN:
@@ -403,9 +401,7 @@ static void usb_8dev_rx_err_msg(struct usb_8dev_priv *priv,
 		tx_errors = 1;
 		break;
 	case USB_8DEV_STATUSMSG_CRC:
-		cf->data[2] |= CAN_ERR_PROT_UNSPEC;
-		cf->data[3] |= CAN_ERR_PROT_LOC_CRC_SEQ |
-			       CAN_ERR_PROT_LOC_CRC_DEL;
+		cf->data[3] = CAN_ERR_PROT_LOC_CRC_SEQ;
 		rx_errors = 1;
 		break;
 	case USB_8DEV_STATUSMSG_BIT0:
@@ -463,10 +459,9 @@ static void usb_8dev_rx_err_msg(struct usb_8dev_priv *priv,
 	priv->bec.txerr = txerr;
 	priv->bec.rxerr = rxerr;
 
-	netif_rx(skb);
-
 	stats->rx_packets++;
 	stats->rx_bytes += cf->can_dlc;
+	netif_rx(skb);
 }
 
 /* Read data and status frames */
@@ -496,10 +491,11 @@ static void usb_8dev_rx_can_msg(struct usb_8dev_priv *priv,
 		else
 			memcpy(cf->data, msg->data, cf->can_dlc);
 
-		netif_rx(skb);
-
 		stats->rx_packets++;
 		stats->rx_bytes += cf->can_dlc;
+		netif_rx(skb);
+
+		can_led_event(priv->netdev, CAN_LED_EVENT_RX);
 	} else {
 		netdev_warn(priv->netdev, "frame type %d unknown",
 			 msg->type);
@@ -507,8 +503,7 @@ static void usb_8dev_rx_can_msg(struct usb_8dev_priv *priv,
 
 }
 
-/*
- * Callback for reading data from device
+/* Callback for reading data from device
  *
  * Check urb status, call read function and resubmit urb read operation.
  */
@@ -529,6 +524,8 @@ static void usb_8dev_read_bulk_callback(struct urb *urb)
 		break;
 
 	case -ENOENT:
+	case -EPIPE:
+	case -EPROTO:
 	case -ESHUTDOWN:
 		return;
 
@@ -567,8 +564,7 @@ resubmit_urb:
 			"failed resubmitting read bulk urb: %d\n", retval);
 }
 
-/*
- * Callback handler for write operations
+/* Callback handler for write operations
  *
  * Free allocated buffers, check transmit status and
  * calculate statistic.
@@ -602,6 +598,8 @@ static void usb_8dev_write_bulk_callback(struct urb *urb)
 
 	can_get_echo_skb(netdev, context->echo_index);
 
+	can_led_event(netdev, CAN_LED_EVENT_TX);
+
 	/* Release context */
 	context->echo_index = MAX_TX_URBS;
 
@@ -627,10 +625,8 @@ static netdev_tx_t usb_8dev_start_xmit(struct sk_buff *skb,
 
 	/* create a URB, and a buffer for it, and copy the data to the URB */
 	urb = usb_alloc_urb(0, GFP_ATOMIC);
-	if (!urb) {
-		netdev_err(netdev, "No memory left for URBs\n");
+	if (!urb)
 		goto nomem;
-	}
 
 	buf = usb_alloc_coherent(priv->udev, size, GFP_ATOMIC,
 				 &urb->transfer_dma);
@@ -663,8 +659,7 @@ static netdev_tx_t usb_8dev_start_xmit(struct sk_buff *skb,
 		}
 	}
 
-	/*
-	 * May never happen! When this happens we'd more URBs in flight as
+	/* May never happen! When this happens we'd more URBs in flight as
 	 * allowed (MAX_TX_URBS).
 	 */
 	if (!context)
@@ -691,8 +686,7 @@ static netdev_tx_t usb_8dev_start_xmit(struct sk_buff *skb,
 		/* Slow down tx path */
 		netif_stop_queue(netdev);
 
-	/*
-	 * Release our reference to this URB, the USB core will eventually free
+	/* Release our reference to this URB, the USB core will eventually free
 	 * it entirely.
 	 */
 	usb_free_urb(urb);
@@ -754,7 +748,6 @@ static int usb_8dev_start(struct usb_8dev_priv *priv)
 		/* create a URB, and a buffer for it */
 		urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!urb) {
-			netdev_err(netdev, "No memory left for URBs\n");
 			err = -ENOMEM;
 			break;
 		}
@@ -827,6 +820,8 @@ static int usb_8dev_open(struct net_device *netdev)
 	if (err)
 		return err;
 
+	can_led_event(netdev, CAN_LED_EVENT_OPEN);
+
 	/* finally start device */
 	err = usb_8dev_start(priv);
 	if (err) {
@@ -879,6 +874,8 @@ static int usb_8dev_close(struct net_device *netdev)
 
 	close_candev(netdev);
 
+	can_led_event(netdev, CAN_LED_EVENT_STOP);
+
 	return err;
 }
 
@@ -886,6 +883,7 @@ static const struct net_device_ops usb_8dev_netdev_ops = {
 	.ndo_open = usb_8dev_open,
 	.ndo_stop = usb_8dev_close,
 	.ndo_start_xmit = usb_8dev_start_xmit,
+	.ndo_change_mtu = can_change_mtu,
 };
 
 static const struct can_bittiming_const usb_8dev_bittiming_const = {
@@ -900,8 +898,7 @@ static const struct can_bittiming_const usb_8dev_bittiming_const = {
 	.brp_inc = 1,
 };
 
-/*
- * Probe USB device
+/* Probe USB device
  *
  * Check device and firmware.
  * Set supported modes and bittiming constants.
@@ -956,12 +953,10 @@ static int usb_8dev_probe(struct usb_interface *intf,
 	for (i = 0; i < MAX_TX_URBS; i++)
 		priv->tx_contexts[i].echo_index = MAX_TX_URBS;
 
-	priv->cmd_msg_buffer = kzalloc(sizeof(struct usb_8dev_cmd_msg),
-				      GFP_KERNEL);
-	if (!priv->cmd_msg_buffer) {
-		netdev_err(netdev, "Couldn't alloc Tx buffer\n");
+	priv->cmd_msg_buffer = devm_kzalloc(&intf->dev, sizeof(struct usb_8dev_cmd_msg),
+					    GFP_KERNEL);
+	if (!priv->cmd_msg_buffer)
 		goto cleanup_candev;
-	}
 
 	usb_set_intfdata(intf, priv);
 
@@ -973,7 +968,7 @@ static int usb_8dev_probe(struct usb_interface *intf,
 	if (err) {
 		netdev_err(netdev,
 			"couldn't register CAN device: %d\n", err);
-		goto cleanup_cmd_msg_buffer;
+		goto cleanup_candev;
 	}
 
 	err = usb_8dev_cmd_version(priv, &version);
@@ -987,13 +982,12 @@ static int usb_8dev_probe(struct usb_interface *intf,
 			 (version>>8) & 0xff, version & 0xff);
 	}
 
+	devm_can_led_init(netdev);
+
 	return 0;
 
 cleanup_unregister_candev:
 	unregister_netdev(priv->netdev);
-
-cleanup_cmd_msg_buffer:
-	kfree(priv->cmd_msg_buffer);
 
 cleanup_candev:
 	free_candev(netdev);
